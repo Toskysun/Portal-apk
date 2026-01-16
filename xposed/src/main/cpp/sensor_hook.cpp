@@ -2,15 +2,17 @@
 // Created by fuqiuluo on 2024/10/15.
 //
 #include <dobby.h>
+#include <atomic>
 #include <unistd.h>
 #include "sensor_hook.h"
 #include "logging.h"
 #include "elf_util.h"
 #include "dobby_hook.h"
 
-#define LIBSF_PATH "/system/lib64/libsensorservice.so"
+// Resolve actual on-device path via /proc/self/maps (APEX/system variations).
+static constexpr const char* kSensorServiceSoName = "libsensorservice.so";
 
-extern bool enableSensorHook;
+extern std::atomic_bool enableSensorHook;
 
 // _ZN7android16SensorEventQueue5writeERKNS_2spINS_7BitTubeEEEPK12ASensorEventm
 OriginalSensorEventQueueWriteType OriginalSensorEventQueueWrite = nullptr;
@@ -18,14 +20,14 @@ OriginalSensorEventQueueWriteType OriginalSensorEventQueueWrite = nullptr;
 OriginalConvertToSensorEventType OriginalConvertToSensorEvent = nullptr;
 
 int64_t SensorEventQueueWrite(void *tube, void *events, int64_t numEvents) {
-    if (enableSensorHook) {
+    if (enableSensorHook.load(std::memory_order_relaxed)) {
         LOGD("SensorEventQueueWrite called");
     }
     return OriginalSensorEventQueueWrite(tube, events, numEvents);
 }
 
 void ConvertToSensorEvent(void *src, void *dst) {
-    if (enableSensorHook) {
+    if (enableSensorHook.load(std::memory_order_relaxed)) {
         auto a = *(int32_t *)((char*)src + 4);
         auto b = *(int32_t *)((char*)src + 8);
         auto c = *(int64_t *)((char*)src + 16);
@@ -47,20 +49,22 @@ void ConvertToSensorEvent(void *src, void *dst) {
             *(int8_t *)((char*)dst + 28) = *(int8_t *)((char*)src + 36);
         }
     } else {
-        OriginalConvertToSensorEvent(src, dst);
+        if (OriginalConvertToSensorEvent != nullptr) {
+            OriginalConvertToSensorEvent(src, dst);
+        }
     }
 
-    if (enableSensorHook) {
+    if (enableSensorHook.load(std::memory_order_relaxed)) {
         LOGD("ConvertToSensorEvent called");
     }
 }
 
-void doSensorHook() {
-    SandHook::ElfImg sensorService(LIBSF_PATH);
+bool doSensorHook() {
+    SandHook::ElfImg sensorService(kSensorServiceSoName);
 
     if (!sensorService.isValid()) {
         LOGE("failed to load libsensorservice");
-        return;
+        return false;
     }
 
     auto sensorWrite = sensorService.getSymbolAddress<void*>("_ZN7android16SensorEventQueue5writeERKNS_2spINS_7BitTubeEEEPK12ASensorEventm");
@@ -73,12 +77,18 @@ void doSensorHook() {
     LOGD("Dobby SensorEventQueue::write found at %p", sensorWrite);
     LOGD("Dobby convertToSensorEvent found at %p", convertToSensorEvent);
 
+    bool installedAny = false;
     if (sensorWrite != nullptr) {
-        OriginalSensorEventQueueWrite = (OriginalSensorEventQueueWriteType)InlineHook(sensorWrite, (void *)SensorEventQueueWrite);
+        auto orig = InlineHook(sensorWrite, (void *)SensorEventQueueWrite);
+        OriginalSensorEventQueueWrite = (OriginalSensorEventQueueWriteType)orig;
+        installedAny |= (orig != nullptr);
     }
 
     if (convertToSensorEvent != nullptr) {
-        OriginalConvertToSensorEvent = (OriginalConvertToSensorEventType)InlineHook(convertToSensorEvent, (void *)ConvertToSensorEvent);
+        auto orig = InlineHook(convertToSensorEvent, (void *)ConvertToSensorEvent);
+        OriginalConvertToSensorEvent = (OriginalConvertToSensorEventType)orig;
+        installedAny |= (orig != nullptr);
     }
-}
 
+    return installedAny;
+}
